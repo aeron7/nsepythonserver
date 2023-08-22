@@ -12,7 +12,7 @@ setuptools.setup(
     long_description=long_description,
     long_description_content_type="text/markdown",  author = 'Aeron7',
     author_email = 'dexter@unofficed.com',
-    url = 'https://github.com/aeron7/nsepython',
+    url = 'https://github.com/aeron7/nsepythonserver',
     install_requires=['requests', 'pandas','scipy'],
     keywords = ['nseindia', 'nse', 'python', 'sdk', 'trading', 'stock markets'],
     classifiers=[
