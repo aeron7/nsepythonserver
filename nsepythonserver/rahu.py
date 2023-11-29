@@ -927,3 +927,9 @@ def nse_expirydetails_by_symbol(symbol,meta ="Futures",i=0):
     currentExpiry = datetime.datetime.strptime(currentExpiry,'%d-%b-%Y').date()    
     dte = (currentExpiry - datetime.datetime.now().date()).days
     return currentExpiry,dte
+
+def security_wise_archive(from_date, to_date, symbol, series="ALL"):   
+    base_url = "https://www.nseindia.com/api/historical/securityArchives"
+    url = f"{base_url}?from={from_date}&to={to_date}&symbol={symbol.upper()}&dataType=priceVolumeDeliverable&series={series.upper()}"
+    payload = nsefetch(url)
+    return pd.DataFrame(payload['data'])
