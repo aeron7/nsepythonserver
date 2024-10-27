@@ -34,7 +34,7 @@ if(mode=='local'):
     def nsefetch(payload):
         try:
             output = requests.get(payload,headers=headers).json()
-            print(output)
+            #print(output)
         except ValueError:
             s =requests.Session()
             output = s.get("http://nseindia.com",headers=headers)
@@ -692,7 +692,7 @@ def expiry_history(symbol,start_date="",end_date="",type="options"):
     nsefetch_url = "https://www.nseindia.com/api/historical/fo/derivatives/meta?&from="+start_date+"&to="+end_date+"&symbol="+symbol+""
     payload = nsefetch(nsefetch_url)
 
-    print(payload)
+    #print(payload)
 
     for key, value in payload['expiryDatesByInstrument'].items():
       if type.lower() == "options" and "OPT" in key:
@@ -743,22 +743,22 @@ niftyindices_headers = {
 }
 
 def index_history(symbol,start_date,end_date):
-    data = "{'name':'"+symbol+"','startDate':'"+start_date+"','endDate':'"+end_date+"'}"
-    payload = requests.post('https://niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString', headers=niftyindices_headers,  data=data).json()
+    data = {'cinfo': "{'name':'" + symbol + "','startDate':'" + start_date + "','endDate':'" + end_date + "','indexName':'" + symbol + "'}"}
+    payload = requests.post('https://niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString', headers=niftyindices_headers,  json=data).json()
     payload = json.loads(payload["d"])
     payload=pd.DataFrame.from_records(payload)
     return payload
 
 def index_pe_pb_div(symbol,start_date,end_date):
-    data = "{'name':'"+symbol+"','startDate':'"+start_date+"','endDate':'"+end_date+"'}"
-    payload = requests.post('https://niftyindices.com/Backpage.aspx/getpepbHistoricaldataDBtoString', headers=niftyindices_headers,  data=data).json()
+    data = {'cinfo': "{'name':'" + symbol + "','startDate':'" + start_date + "','endDate':'" + end_date + "','indexName':'" + symbol + "'}"}
+    payload = requests.post('https://niftyindices.com/Backpage.aspx/getpepbHistoricaldataDBtoString', headers=niftyindices_headers,  json=data).json()
     payload = json.loads(payload["d"])
     payload=pd.DataFrame.from_records(payload)
     return payload
 
 def index_total_returns(symbol,start_date,end_date):
-    data = "{'name':'"+symbol+"','startDate':'"+start_date+"','endDate':'"+end_date+"'}"
-    payload = requests.post('https://niftyindices.com/Backpage.aspx/getTotalReturnIndexString', headers=niftyindices_headers,  data=data).json()
+    data = {'cinfo': "{'name':'" + symbol + "','startDate':'" + start_date + "','endDate':'" + end_date + "','indexName':'" + symbol + "'}"}
+    payload = requests.post('https://niftyindices.com/Backpage.aspx/getTotalReturnIndexString', headers=niftyindices_headers,  json=data).json()
     payload = json.loads(payload["d"])
     payload=pd.DataFrame.from_records(payload)
     return payload
