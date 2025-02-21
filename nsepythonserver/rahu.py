@@ -2,6 +2,7 @@ import os,sys
 #os.chdir(os.path.dirname(os.path.abspath(__file__)))
 #sys.path.insert(1, os.path.join(sys.path[0], '..'))
 
+from typing import Union
 import requests
 import pandas as pd
 import json
@@ -444,11 +445,31 @@ def nse_get_index_list():
     payload = pd.DataFrame(payload["data"])
     return payload["indexName"].tolist()
 
-def nse_get_index_quote(index):
+def nse_get_index_quote(index: Union[list, str]) -> dict[dict]:
+    """
+    This function can be used to fetch to fetch quotes of a single or multiple indices.
+    Args:
+        index (str, list): if for single index, then str, if for multiple then list of index names.
+    
+    Returns:
+        Returns a dictionary where the key is the index name and the value is the quote of the index respectively.
+    """
+    if isinstance(index, str):
+        index = [index]
+    
     payload = nsefetch('https://iislliveblob.niftyindices.com/jsonfiles/LiveIndicesWatch.json')
-    for m in range(len(payload['data'])):
-        if(payload['data'][m]["indexName"] == index.upper()):
-            return payload['data'][m]
+    returned_data = payload.get('data')
+
+    # initializing an empty dict to store the requested data
+    fetched_data = dict()
+    
+    for item in returned_data:
+        if item.get('indexName') in index:
+            fetched_data[item.get('indexName')] = item
+    
+    return fetched_data
+
+
 
 def nse_get_advances_declines(mode="pandas"):
     try:
