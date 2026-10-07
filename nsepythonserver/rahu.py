@@ -9,49 +9,151 @@ import random
 import datetime,time
 import logging
 import re
-import urllib.parse 
+import urllib.parse
 
-mode ='vpn'
+# ---------------------------------------------------------------------------
+# NSE's site is behind Akamai Bot Manager, which fingerprints the TLS/JA3
+# handshake. Plain `requests` (and plain `curl`) get a 403 on the homepage
+# itself, regardless of User-Agent -- it is NOT a "requests is blocked in
+# India" thing (see github.com/aeron7/nsepython issue #73), it is a TLS
+# fingerprint check. curl_cffi impersonates a real Chrome TLS fingerprint and
+# clears it. It is a hard dependency for this module now (both the old
+# mode='vpn' os.popen-curl path and the old mode='local' plain-requests path
+# are equally broken against the live site), so we import it eagerly and
+# raise a clear, actionable error if it's missing rather than silently
+# falling back to a transport that cannot work.
+try:
+    from curl_cffi.requests import Session as _CurlSession
+    _CURL_CFFI_OK = True
+except ImportError:
+    _CURL_CFFI_OK = False
 
-if mode == "vpn":
-    def nsefetch(payload: str):
-        def encode(url: str) -> str:
-            if "%26" in url or "%20" in url:
-                return url
-            return urllib.parse.quote(url, safe=":/?&=")
+mode = 'vpn'  # kept for backward compatibility with code that reads rahu.mode;
+              # the transport below is curl_cffi-based regardless of its value.
 
-        def refresh_cookies():
-            os.popen(f'curl -c cookies.txt "https://www.nseindia.com" {curl_headers}').read()
-            os.popen(f'curl -b cookies.txt -c cookies.txt "https://www.nseindia.com/option-chain" {curl_headers}').read()
 
-        if not os.path.exists("cookies.txt"):
-            refresh_cookies()
+class NSEFetchError(Exception):
+    """Raised by nsefetch() when an NSE endpoint can't be reached or doesn't
+    return usable JSON, instead of the old behaviour of silently swallowing
+    the error and returning {} -- which was itself the root cause of several
+    confusing downstream KeyErrors reported against this library (e.g.
+    nsepython #74, #75, nsepythonserver #6): callers would do payload["data"]
+    on an empty {} and get a KeyError with no indication the real problem was
+    an upstream 403/404/503."""
+    pass
 
-        encoded_url = encode(payload)
-        cmd = f'curl -b cookies.txt "{encoded_url}" {curl_headers}'
-        raw = os.popen(cmd).read()
 
+_nse_session = None
+_nse_warmed = False
+
+# Headers sent on every API call (beyond whatever curl_cffi's Chrome
+# impersonation already sets for us).
+api_headers = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/option-chain",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+}
+
+
+def _get_nse_session(force_refresh: bool = False):
+    """Return a warmed curl_cffi session impersonating Chrome. Warming means
+    visiting a couple of real nseindia.com pages first so Akamai hands out
+    its tracking cookies (_abck/ak_bmsc/bm_sv/...) before we hit the API --
+    without this, API calls 403/404 even with the right TLS fingerprint."""
+    global _nse_session, _nse_warmed
+    if not _CURL_CFFI_OK:
+        raise NSEFetchError(
+            "curl_cffi is required to talk to nseindia.com -- plain `requests` "
+            "(and plain `curl`) get a 403 on the homepage itself because NSE's "
+            "Akamai Bot Manager fingerprints the TLS/JA3 handshake, not because "
+            "of geography. Install it with: pip install curl_cffi"
+        )
+    if _nse_session is None or force_refresh:
+        _nse_session = _CurlSession(impersonate="chrome124")
+        _nse_warmed = False
+    if not _nse_warmed:
         try:
-            return json.loads(raw)
-        except ValueError:
-            refresh_cookies()
-            raw = os.popen(cmd).read()
+            _nse_session.get("https://www.nseindia.com", timeout=20)
+            time.sleep(1.2)
+            _nse_session.get("https://www.nseindia.com/market-data/live-equity-market", timeout=20)
+            time.sleep(1.2)
+            _nse_session.get("https://www.nseindia.com/option-chain", timeout=20)
+            time.sleep(1.0)
+            _nse_warmed = True
+        except Exception as _e:
+            logging.warning(f"NSE session warm-up partial failure: {_e}")
+    return _nse_session
+
+
+def _equity_stockindices_fallback(session):
+    """/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O is a retired
+    route (404s under Akamai, confirmed live, cookies make no difference --
+    it's simply gone, not JS-walled). /api/market-data-pre-open?key=FO
+    carries the same F&O stock universe with the same per-stock fields, so we
+    reshape its payload to look like the old equity-stockIndices response.
+    This is done transparently inside nsefetch() so every existing caller
+    (fnolist, nse_custom_function_secfno, nsetools_get_quote,
+    nse_get_advances_declines, nse_get_top_losers/gainers) keeps working
+    unchanged."""
+    r = session.get(
+        "https://www.nseindia.com/api/market-data-pre-open?key=FO",
+        headers=api_headers, timeout=30,
+    )
+    if r.status_code != 200:
+        raise NSEFetchError(
+            f"equity-stockIndices fallback (market-data-pre-open?key=FO) failed: HTTP {r.status_code}"
+        )
+    raw = r.json()
+    reshaped = []
+    for item in raw.get("data", []):
+        m = item.get("metadata", {})
+        if not m.get("symbol"):
+            continue
+        reshaped.append({
+            "symbol": m.get("symbol", ""),
+            "pChange": m.get("pChange", 0),
+            "lastPrice": m.get("lastPrice", 0),
+            "change": m.get("change", 0),
+            "previousClose": m.get("previousClose", 0),
+            "yearHigh": m.get("yearHigh", 0),
+            "yearLow": m.get("yearLow", 0),
+            "totalTradedValue": m.get("totalTurnover", 0),
+            "totalTradedVolume": m.get("finalQuantity", 0),
+        })
+    return {"data": reshaped}
+
+
+def nsefetch(payload: str):
+    """GET a JSON NSE endpoint through a warmed curl_cffi (Chrome-impersonating)
+    session. Raises NSEFetchError on persistent failure instead of returning {}."""
+    session = _get_nse_session()
+
+    if "equity-stockIndices" in payload and "SECURITIES" in payload:
+        return _equity_stockindices_fallback(session)
+
+    try:
+        r = session.get(payload, headers=api_headers, timeout=30)
+        if r.status_code in (403, 404):
+            # Session cookies may have gone stale -- re-warm once and retry
+            # before giving up.
+            session = _get_nse_session(force_refresh=True)
+            r = session.get(payload, headers=api_headers, timeout=30)
+        if r.status_code == 200:
             try:
-                return json.loads(raw)
-            except ValueError:
-                return {}
-
-if(mode=='local'):
-    def nsefetch(payload):
-
-        try:
-            s = requests.Session()
-            s.get("https://www.nseindia.com", headers=headers, timeout=10)
-            s.get("https://www.nseindia.com/option-chain", headers=headers, timeout=10)
-            output = s.get(payload, headers=headers, timeout=10).json()
-        except ValueError:
-            output = {}
-        return output
+                return r.json()
+            except ValueError as e:
+                raise NSEFetchError(
+                    f"nsefetch {payload}: HTTP 200 but response body is not valid JSON ({e}); "
+                    f"first 200 chars: {r.text[:200]!r}"
+                )
+        raise NSEFetchError(f"nsefetch {payload}: HTTP {r.status_code}")
+    except NSEFetchError:
+        raise
+    except Exception as e:
+        raise NSEFetchError(f"nsefetch {payload}: {e}")
 
 
 headers = {
@@ -205,8 +307,25 @@ def oi_chain_builder(symbol,expiry="latest",oi_mode="full"):
     oi_data = pd.DataFrame(rows_list)
     timestamp = payload.get('timestamp', payload.get('records', {}).get('timestamp', ''))
     underlyingValue = payload.get('underlyingValue', payload.get('records', {}).get('underlyingValue', 0))
+
+    # getSymbolDerivativesData (the current option-chain data source, see
+    # nse_optionchain_scrapper) doesn't carry underlyingValue at the top level
+    # at all -- only inside each individual CE/PE leaf. Without this fallback
+    # underlyingValue silently stays 0 (see github.com/aeron7/nsepython #80).
+    if not underlyingValue and data_list:
+        for entry in data_list:
+            for side in ('CE', 'PE'):
+                leaf = entry.get(side)
+                if leaf:
+                    uv = leaf.get('underlyingValue')
+                    if uv:
+                        underlyingValue = uv
+                        break
+            if underlyingValue:
+                break
+
     oi_data['time_stamp'] = timestamp
-    return oi_data, float(underlyingValue), timestamp
+    return oi_data, float(underlyingValue or 0), timestamp
 
 
 def nse_quote_derivatives(symbol):
@@ -228,8 +347,117 @@ def nse_quote(symbol,section=""):
             payload = nsefetch('https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolData&marketType=N&series=EQ&symbol='+symbol)
         return payload
 
+    if(section=="trade_info"):
+        # The old https://www.nseindia.com/api/quote-equity?section=trade_info
+        # route is dead (confirmed HTTP 403 live, even through the fully
+        # warmed curl_cffi session used everywhere else in this file). But
+        # every piece of data that endpoint used to return is already present
+        # in the no-section GetQuoteApi?functionName=getSymbolData response
+        # fetched above -- no new network call needed, just remapping/
+        # slicing fields that are already being pulled. This remaps the new
+        # payload['equityResponse'][0] sub-objects (orderBook/tradeInfo/
+        # priceInfo/metaData/secInfo) back into the shape old trade_info
+        # callers expect (marketDeptOrderBook/securityWiseDP/preOpenMarket).
+        #
+        # One confirmed fidelity gap: the old preOpenMarket object was a rich
+        # nested structure (per-price-level pre-open order book, ATO
+        # buy/sell, etc) built from NSE's separate pre-open-market feed. The
+        # new endpoint only carries a handful of scalar pre-open fields
+        # flattened into metaData (iep/ieq/ic_change/ic_pchange/spoChange/
+        # spoPchange/casStatus) -- these were all 0 when last tested outside
+        # the 9:00-9:08 pre-open window (NSE zeroes them once continuous
+        # trading starts), so the preopen-price-level array itself could not
+        # be verified and is NOT fabricated here; preOpenMarket below only
+        # carries the scalar fields that are genuinely available.
+        base_payload = nse_quote(symbol, section="")
+        try:
+            eq = base_payload['equityResponse'][0]
+        except (KeyError, IndexError, TypeError):
+            # Index symbols (NIFTY/BANKNIFTY/FINNIFTY) go through the
+            # derivatives payload shape above and have no cash-market
+            # trade_info to remap -- return the raw base payload rather than
+            # fabricate a shape that doesn't apply to indices.
+            return base_payload
+
+        trade_info = eq.get('tradeInfo', {}) or {}
+        order_book = eq.get('orderBook', {}) or {}
+        price_info = eq.get('priceInfo', {}) or {}
+        meta_data = eq.get('metaData', {}) or {}
+        sec_info = eq.get('secInfo', {}) or {}
+
+        bid = [
+            {"price": order_book.get(f"buyPrice{i}"), "quantity": order_book.get(f"buyQuantity{i}")}
+            for i in range(1, 6)
+        ]
+        ask = [
+            {"price": order_book.get(f"sellPrice{i}"), "quantity": order_book.get(f"sellQuantity{i}")}
+            for i in range(1, 6)
+        ]
+
+        payload = {
+            "noBlockDeals": True,
+            "bulkBlockDeals": [],
+            "marketDeptOrderBook": {
+                "totalBuyQuantity": order_book.get("totalBuyQuantity"),
+                "totalSellQuantity": order_book.get("totalSellQuantity"),
+                "bid": bid,
+                "ask": ask,
+                "tradeInfo": {
+                    "totalTradedVolume": trade_info.get("totalTradedVolume"),
+                    "totalTradedValue": trade_info.get("totalTradedValue"),
+                    "totalMarketCap": trade_info.get("totalMarketCap"),
+                    "ffmc": trade_info.get("ffmc"),
+                    "impactCost": trade_info.get("impactCost"),
+                    "cmDailyVolatility": price_info.get("cmDailyVolatility"),
+                    "cmAnnualVolatility": price_info.get("cmAnnualVolatility"),
+                    "marketLot": trade_info.get("marketLot"),
+                    "activeSeries": [trade_info.get("series")] if trade_info.get("series") else [],
+                },
+                "valueAtRisk": {
+                    "securityVar": sec_info.get("securityvar"),
+                    "indexVar": sec_info.get("indexvar"),
+                    "varMargin": sec_info.get("varMargin"),
+                    "extremeLossMargin": sec_info.get("extremelossMargin"),
+                    "adhocMargin": sec_info.get("adhocMargin"),
+                    "applicableMargin": trade_info.get("applicableMargin"),
+                },
+            },
+            "securityWiseDP": {
+                "quantityTraded": trade_info.get("quantitytraded"),
+                "deliveryQuantity": trade_info.get("deliveryquantity"),
+                "deliveryToTradedQuantity": trade_info.get("deliveryToTradedQuantity"),
+                "seriesRemarks": None,
+                "secWiseDelPosDate": trade_info.get("secwisedelposdate"),
+            },
+            # yearHigh/yearLow etc (old section="" response's priceInfo) --
+            # kept here too since old trade_info responses also echoed 52wk
+            # data under priceInfo.
+            "priceInfo": {
+                "yearHigh": price_info.get("yearHigh"),
+                "yearLow": price_info.get("yearLow"),
+                "yearHighDt": price_info.get("yearHightDt"),
+                "yearLowDt": price_info.get("yearLowDt"),
+                "tickSize": price_info.get("tickSize"),
+                "priceBand": price_info.get("priceBand"),
+            },
+            # See the fidelity-gap note above: only the scalar pre-open
+            # fields that exist in the new payload are included; the old
+            # nested per-price-level preopen array is not available without
+            # a separate call to the pre-open-market endpoint and is not
+            # fabricated here.
+            "preOpenMarket": {
+                "IEP": meta_data.get("iep"),
+                "finalQuantity": meta_data.get("ieq"),
+                "Change": meta_data.get("ic_change"),
+                "perChange": meta_data.get("ic_pchange"),
+                "prevClose": meta_data.get("previousClose"),
+                "preopen": [],
+            },
+        }
+        return payload
+
     if(section!=""):
-        payload = nsefetch('https://www.nseindia.com/api/quote-equity?symbol='+symbol+'&section='+section)            
+        payload = nsefetch('https://www.nseindia.com/api/quote-equity?symbol='+symbol+'&section='+section)
         return payload
 def nse_expirydetails(payload, i=0, symbol=None):
     expiry_dates = []
@@ -551,33 +779,89 @@ def nse_optionchain_ltp(payload,strikePrice,optionType,inp=0,intent=""):
           if(intent=="sell"): return payload['records']['data'][x][optionType]['bidprice']
           if(intent=="buy"): return payload['records']['data'][x][optionType]['askPrice']
 
+def _reshape_equity_quote(raw):
+    """/api/quote-equity (nse_eq's old data source) is dead (confirmed live
+    403 Access Denied, Apache/WAF-style, not an Akamai JS challenge -- there
+    is no cookie that fixes it). The live quote page itself now calls
+    GetQuoteApi?functionName=getSymbolData instead, which carries nearly all
+    the same information, just regrouped. We reshape it back into the old
+    quote-equity top-level key names (info/metadata/priceInfo/securityInfo/
+    tradeInfo) as closely as the new payload allows, so code written against
+    the old shape (payload['priceInfo']['lastPrice'],
+    payload['metadata']['pdSymbolPe'], etc.) keeps working. The full
+    unmodified NextApi response is also kept under '_raw' for anyone who
+    wants the new field names directly."""
+    if not raw or 'equityResponse' not in raw or not raw['equityResponse']:
+        return raw
+    row = raw['equityResponse'][0]
+    meta = row.get('metaData', {}) or {}
+    sec = row.get('secInfo', {}) or {}
+    trade = row.get('tradeInfo', {}) or {}
+    price = row.get('priceInfo', {}) or {}
+    order = row.get('orderBook', {}) or {}
+
+    reshaped = {
+        'info': {
+            'symbol': meta.get('symbol'),
+            'companyName': meta.get('companyName'),
+            'industry': sec.get('basicIndustry'),
+            'isin': meta.get('isinCode'),
+            'series': meta.get('series'),
+        },
+        'metadata': {
+            **meta,
+            'pdSectorPe': sec.get('pdSectorPe'),
+            'pdSymbolPe': sec.get('pdSymbolPe'),
+            'pdSectorInd': sec.get('pdSectorInd'),
+        },
+        'priceInfo': {
+            'lastPrice': order.get('lastPrice', meta.get('closePrice')),
+            'change': meta.get('change'),
+            'pChange': meta.get('pChange'),
+            'previousClose': meta.get('previousClose'),
+            'open': meta.get('open'),
+            'close': meta.get('closePrice'),
+            'vwap': meta.get('averagePrice'),
+            'intraDayHighLow': {'min': meta.get('dayLow'), 'max': meta.get('dayHigh'),
+                                 'value': order.get('lastPrice', meta.get('closePrice'))},
+            'weekHighLow': {'min': price.get('yearLow'), 'max': price.get('yearHigh'),
+                             'minDate': price.get('yearLowDt'), 'maxDate': price.get('yearHightDt')},
+        },
+        'securityInfo': sec,
+        'tradeInfo': trade,
+        'preOpenMarket': {},
+        '_raw': raw,
+    }
+    return reshaped
+
+
 def nse_eq(symbol):
+    # /api/quote-equity is a dead endpoint (403 Access Denied, confirmed
+    # live -- not fixable with cookies, it's a hard WAF block, not an Akamai
+    # JS-sensor challenge). Use the NextApi endpoint the live quote page
+    # itself now calls, reshaped to look like the old response.
     symbol = nsesymbolpurify(symbol)
-    try:
-        payload = nsefetch('https://www.nseindia.com/api/quote-equity?symbol='+symbol)
-        try:
-            if(payload['error']=={}):
-                print("Please use nse_fno() function to reduce latency.")
-                payload = nsefetch('https://www.nseindia.com/api/quote-derivative?symbol='+symbol)
-        except:
-            pass
-    except KeyError:
-        print("Getting Error While Fetching.")
-    return payload
+    raw = nsefetch(
+        'https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi?functionName=getSymbolData&marketType=N&series=EQ&symbol=' + symbol
+    )
+    return _reshape_equity_quote(raw)
 
 
 def nse_fno(symbol):
+    # /api/quote-derivative is likewise dead (404, "Resource not found").
+    # nse_quote_derivatives() already calls the live replacement
+    # (getSymbolDerivativesData) and is kept working elsewhere in this file,
+    # so delegate to it rather than duplicating/half-reshaping a different
+    # response shape. Note the returned shape is the new flat
+    # strike/expiry-list shape (payload['data'][i]['CE'/'PE']/...), not the
+    # old nested quote-derivative shape -- NSE killed the old endpoint
+    # outright, so there is no way to reproduce its exact JSON here.
     symbol = nsesymbolpurify(symbol)
-    try:
-        payload = nsefetch('https://www.nseindia.com/api/quote-derivative?symbol='+symbol)
-        try:
-            if(payload['error']=={}):
-                print("Please use nse_eq() function to reduce latency.")
-                payload = nsefetch('https://www.nseindia.com/api/quote-equity?symbol='+symbol)
-        except KeyError:
-            pass
-    except KeyError:
-        print("Getting Error While Fetching.")
+    payload = nse_quote_derivatives(symbol)
+    if not payload or 'data' not in payload:
+        # Not an F&O symbol (or no derivatives data) -- fall back to the
+        # equity quote instead of returning an empty/error payload.
+        return nse_eq(symbol)
     return payload
 
 def quote_equity(symbol):
@@ -660,10 +944,20 @@ def nse_marketStatus():
     return payload
 
 def nse_circular(mode="latest"):
-    if(mode=="latest"):
-        payload = nsefetch('https://nseindia.com/api/latest-circular')
-    else:
-        payload = nsefetch('https://www.nseindia.com/api/circulars')
+    # The old mode="latest" path (nseindia.com/api/latest-circular, no "www.",
+    # singular "latest-circular") is NOT an Akamai wall -- it comes back
+    # HTTP 200 but with NSE's own "route doesn't exist" body
+    # {'error': True, 'status': 500}, confirmed live. NSE renamed the
+    # circulars listing page itself from /resources/circulars to
+    # /resources/exchange-communication-circulars at some point; a Playwright
+    # network capture on that current live page shows it calls
+    # https://www.nseindia.com/api/circulars (with optional
+    # fromDate/toDate=DD-MM-YYYY params, defaulting to the last 7 days when
+    # omitted) for BOTH a "latest" view and a custom-range view -- there is no
+    # separate "latest" endpoint anymore. The mode!="latest" branch below
+    # already called this correct URL; "latest" just needs routing to the
+    # same place instead of the dead legacy path.
+    payload = nsefetch('https://www.nseindia.com/api/circulars')
     return payload
 
 def nse_fiidii(mode="pandas"):
@@ -683,21 +977,33 @@ def nsetools_get_quote(symbol):
             return payload['data'][m]
 
 
+# iislliveblob.niftyindices.com (the old data source for the three functions
+# below) is a dead host -- DNS NXDOMAIN, confirmed repeatedly live. There is
+# no successor on that domain; /api/allIndices on nseindia.com itself (same
+# transport/session as everything else in this file) carries the same -- in
+# fact a much larger -- live index universe, so we use that instead and alias
+# its "index" field to "indexName" so existing callers keep working.
+def _nse_all_indices_as_indexname():
+    payload = nsefetch("https://www.nseindia.com/api/allIndices")
+    data = payload.get("data", [])
+    for row in data:
+        if "indexName" not in row:
+            row["indexName"] = row.get("index", "")
+    return data
+
 def nse_index():
-    payload = nsefetch('https://iislliveblob.niftyindices.com/jsonfiles/LiveIndicesWatch.json')
-    payload = pd.DataFrame(payload["data"])
+    payload = pd.DataFrame(_nse_all_indices_as_indexname())
     return payload
 
 def nse_get_index_list():
-    payload = nsefetch('https://iislliveblob.niftyindices.com/jsonfiles/LiveIndicesWatch.json')
-    payload = pd.DataFrame(payload["data"])
+    payload = pd.DataFrame(_nse_all_indices_as_indexname())
     return payload["indexName"].tolist()
 
 def nse_get_index_quote(index):
-    payload = nsefetch('https://iislliveblob.niftyindices.com/jsonfiles/LiveIndicesWatch.json')
-    for m in range(len(payload['data'])):
-        if(payload['data'][m]["indexName"] == index.upper()):
-            return payload['data'][m]
+    data = _nse_all_indices_as_indexname()
+    for m in range(len(data)):
+        if(data[m]["indexName"] == index.upper()):
+            return data[m]
 
 def nse_get_advances_declines(mode="pandas"):
     try:
@@ -723,26 +1029,56 @@ def nse_get_top_gainers():
     return df.head(5)
 
 def nse_get_fno_lot_sizes(symbol="all",mode="list"):
-    url="https://archives.nseindia.com/content/fo/fo_mktlots.csv"
+    # github.com/aeron7/nsepythonserver #4 reports this as broken because NSE
+    # "discontinued" the report (linking FAOP61157.pdf). Live-verified that's
+    # a red herring: archives.nseindia.com/content/fo/fo_mktlots.csv now
+    # silently redirects to an unrelated PDF circular (stale link from NSE's
+    # archives -> nsearchives host migration), but the real CSV report is
+    # still published live, just moved to nsearchives.nseindia.com. That host
+    # also needs curl_cffi specifically -- plain `requests`/`pd.read_csv`
+    # hang against it even though they work fine against the old
+    # archives.nseindia.com host for other CSVs. The column layout changed
+    # too: it's now "UNDERLYING,SYMBOL,<expiry1>,<expiry2>,..." with the lot
+    # size repeated across every live contract month instead of one lot-size
+    # column, so we take the first non-empty month value as the current lot
+    # size.
+    url = "https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv"
+    session = _get_nse_session()
+    r = session.get(url, headers={"Accept": "text/csv"}, timeout=30)
+    if r.status_code != 200:
+        raise NSEFetchError(f"nse_get_fno_lot_sizes: HTTP {r.status_code} fetching {url}")
+    text = r.text
 
     if(mode=="list"):
-        s=requests.get(url).text
         res_dict = {}
-        for line in s.split('\n'):
+        for line in text.split('\n'):
           if line != '' and re.search(',', line) and (line.casefold().find('symbol') == -1):
-              (code, name) = [x.strip() for x in line.split(',')[1:3]]
-              res_dict[code] = int(name)
+              cols = [x.strip() for x in line.split(',')]
+              code = cols[1]
+              lot = ""
+              for c in cols[2:]:
+                  if c != "":
+                      lot = c
+                      break
+              if not code or lot == "":
+                  continue
+              try:
+                  res_dict[code] = int(lot)
+              except ValueError:
+                  continue
         if(symbol=="all"):
             return res_dict
         if(symbol!=""):
             return res_dict[symbol.upper()]
 
     if(mode=="pandas"):
-        payload = pd.read_csv(url)
+        import io
+        payload = pd.read_csv(io.StringIO(text))
+        payload.columns = [c.strip() for c in payload.columns]
         if(symbol=="all"):
             return payload
         else:
-            payload = payload[(payload.iloc[:, 1] == symbol.upper())]
+            payload = payload[(payload.iloc[:, 1].astype(str).str.strip() == symbol.upper())]
             return payload
 
 def whoistheboss():
@@ -792,7 +1128,13 @@ def black_scholes_dexter(S0,X,t,σ="",r=10,q=0.0,td=365):
 
 def equity_history_virgin(symbol,series,start_date,end_date):
     #url="https://www.nseindia.com/api/historical/cm/equity?symbol="+symbol+"&series=[%22"+series+"%22]&from="+str(start_date)+"&to="+str(end_date)+""
-    url = 'https://www.nseindia.com/api/historical/cm/equity?symbol=' + symbol + '&series=["' + series + '"]&from=' + start_date + '&to=' + end_date
+    # NOTE: the original /api/historical/cm/equity route is retired on the
+    # live site (confirmed HTTP 503 as of 2026, even via curl_cffi). NSE's
+    # replacement is /api/historicalOR/cm/equity -- same query params, same
+    # response shape (payload['data'] records with CH_TIMESTAMP/
+    # CH_CLOSING_PRICE/etc), confirmed live, so this is a plain host-path
+    # swap with no downstream parsing changes needed.
+    url = 'https://www.nseindia.com/api/historicalOR/cm/equity?symbol=' + symbol + '&series=["' + series + '"]&from=' + start_date + '&to=' + end_date
 
     payload = nsefetch(url)
     return pd.DataFrame.from_records(payload["data"])
@@ -872,7 +1214,10 @@ def derivative_history_virgin(symbol,start_date,end_date,instrumentType,expiry_d
         strikePrice = "%.2f" % strikePrice
         strikePrice = str(strikePrice)
 
-    nsefetch_url = "https://www.nseindia.com/api/historical/fo/derivatives?&from="+str(start_date)+"&to="+str(end_date)+"&optionType="+optionType+"&strikePrice="+strikePrice+"&expiryDate="+expiry_date+"&instrumentType="+instrumentType+"&symbol="+symbol+""
+    # /api/historical/fo/derivatives is retired (HTTP 503 live); the
+    # confirmed-working replacement is /api/historicalOR/fo/derivatives with
+    # the same query params and response shape.
+    nsefetch_url = "https://www.nseindia.com/api/historicalOR/fo/derivatives?&from="+str(start_date)+"&to="+str(end_date)+"&optionType="+optionType+"&strikePrice="+strikePrice+"&expiryDate="+expiry_date+"&instrumentType="+instrumentType+"&symbol="+symbol+""
     payload = nsefetch(nsefetch_url)
     logging.info(nsefetch_url)
     logging.info(payload)
@@ -938,7 +1283,10 @@ def derivative_history(symbol,start_date,end_date,instrumentType,expiry_date,str
 
 def expiry_history(symbol,start_date="",end_date="",type="options"):
     if(end_date==""):end_date=end_date
-    nsefetch_url = "https://www.nseindia.com/api/historical/fo/derivatives/meta?&from="+start_date+"&to="+end_date+"&symbol="+symbol+""
+    # Same retirement as derivative_history_virgin()/equity_history_virgin()
+    # above -- /api/historical/* is gone, /api/historicalOR/* is the working
+    # replacement with an identical response shape.
+    nsefetch_url = "https://www.nseindia.com/api/historicalOR/fo/derivatives/meta?&from="+start_date+"&to="+end_date+"&symbol="+symbol+""
     payload = nsefetch(nsefetch_url)
 
     #print(payload)
@@ -973,44 +1321,89 @@ def expiry_history(symbol,start_date="",end_date="",type="options"):
     return filtered_date_payload
 
 # # Nifty Indicies Site
+#
+# niftyindices.com is a completely separate host/site from nseindia.com (no
+# Akamai Bot Manager symptoms observed here) -- but it was fully redesigned
+# onto a different CMS at some point: the old ASP.NET WebMethods under
+# `niftyindices.com/Backpage.aspx/*` (returning `{"d": "<json string>"}`) are
+# gone, and POSTing to them now just returns the site's homepage HTML, which
+# is exactly github.com/aeron7/nsepython issue #78's
+# `JSONDecodeError: Expecting value: line 1 column 2 (char 1)`.
+#
+# The working replacement (confirmed live, ported from the already-fixed
+# nsepython sibling repo) is `www.niftyindices.com/BackPage/*` (note: `www.`
+# + `BackPage` not `Backpage.aspx`), which wants a short session warm-up
+# first (visiting the historical-data report page) and returns a direct JSON
+# array rather than the old `{"d": "..."}` wrapper.
 
 niftyindices_headers = {
-    'Connection': 'keep-alive',
-    'sec-ch-ua': '" Not;A Brand";v="99", "Google Chrome";v="91", "Chromium";v="91"',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'DNT': '1',
-    'X-Requested-With': 'XMLHttpRequest',
-    'sec-ch-ua-mobile': '?0',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.77 Safari/537.36',
-    'Content-Type': 'application/json; charset=UTF-8',
-    'Origin': 'https://niftyindices.com',
-    'Sec-Fetch-Site': 'same-origin',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Dest': 'empty',
-    'Referer': 'https://niftyindices.com/reports/historical-data',
     'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+    'Content-Type': 'application/json; charset=UTF-8',
+    'Origin': 'https://www.niftyindices.com',
+    'Referer': 'https://www.niftyindices.com/reports/historical-data',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    'X-Requested-With': 'XMLHttpRequest',
+    'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="130", "Google Chrome";v="130"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
 }
 
-def index_history(symbol,start_date,end_date):
+_niftyindices_session = None
+_niftyindices_warmed = False
+
+
+def _get_niftyindices_session():
+    global _niftyindices_session, _niftyindices_warmed
+    if _niftyindices_session is None:
+        _niftyindices_session = requests.Session()
+    if not _niftyindices_warmed:
+        try:
+            _niftyindices_session.get(
+                "https://www.niftyindices.com/reports/historical-data",
+                headers=niftyindices_headers, timeout=15,
+            )
+            _niftyindices_warmed = True
+        except Exception as e:
+            logging.warning("niftyindices.com session warm-up failed/partial: %s", e)
+    return _niftyindices_session
+
+
+def _niftyindices_fetch(endpoint, symbol, start_date, end_date):
+    session = _get_niftyindices_session()
     data = {'cinfo': "{'name':'" + symbol + "','startDate':'" + start_date + "','endDate':'" + end_date + "','indexName':'" + symbol + "'}"}
-    payload = requests.post('https://niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString', headers=niftyindices_headers,  json=data).json()
-    payload = json.loads(payload["d"])
-    payload=pd.DataFrame.from_records(payload)
-    return payload
+    response = session.post(
+        f"https://www.niftyindices.com/BackPage/{endpoint}",
+        headers=niftyindices_headers, json=data, timeout=20,
+    )
+    text = response.text.strip()
+    if text.startswith('<!DOCTYPE') or text.startswith('<html') or text == "":
+        raise NSEFetchError(
+            f"niftyindices.com/BackPage/{endpoint} returned HTML/empty instead of JSON "
+            f"(HTTP {response.status_code}) -- the site may be down or have changed again."
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise NSEFetchError(
+            f"niftyindices.com/BackPage/{endpoint}: non-JSON body (HTTP {response.status_code})"
+        )
+    # Old API wrapped the payload as {"d": "<json string>"}; the new one
+    # returns the array directly. Support both so this keeps working if
+    # niftyindices.com ever reverts/mixes the two shapes.
+    if isinstance(payload, dict) and "d" in payload:
+        payload = json.loads(payload["d"])
+    return pd.DataFrame.from_records(payload)
+
+
+def index_history(symbol,start_date,end_date):
+    return _niftyindices_fetch("getHistoricaldatatabletoString", symbol, start_date, end_date)
 
 def index_pe_pb_div(symbol,start_date,end_date):
-    data = {'cinfo': "{'name':'" + symbol + "','startDate':'" + start_date + "','endDate':'" + end_date + "','indexName':'" + symbol + "'}"}
-    payload = requests.post('https://niftyindices.com/Backpage.aspx/getpepbHistoricaldataDBtoString', headers=niftyindices_headers,  json=data).json()
-    payload = json.loads(payload["d"])
-    payload=pd.DataFrame.from_records(payload)
-    return payload
+    return _niftyindices_fetch("getpepbHistoricaldataDBtoString", symbol, start_date, end_date)
 
 def index_total_returns(symbol,start_date,end_date):
-    data = {'cinfo': "{'name':'" + symbol + "','startDate':'" + start_date + "','endDate':'" + end_date + "','indexName':'" + symbol + "'}"}
-    payload = requests.post('https://niftyindices.com/Backpage.aspx/getTotalReturnIndexString', headers=niftyindices_headers,  json=data).json()
-    payload = json.loads(payload["d"])
-    payload=pd.DataFrame.from_records(payload)
-    return payload
+    return _niftyindices_fetch("getTotalReturnIndexString", symbol, start_date, end_date)
 
 def get_bhavcopy(date):
     date = date.replace("-","")
@@ -1124,14 +1517,40 @@ def nse_largedeals(mode="bulk_deals"):
     return pd.DataFrame(payload["BLOCK_DEALS_DATA"])
 
 def nse_largedeals_historical(from_date, to_date, mode="bulk_deals"):
+    # The old /api/historical/{bulk-deals,short-selling,block-deals} family is
+    # retired on the live site (confirmed HTTP 503 straight from NSE's origin
+    # -- not an Akamai bot-challenge: the 503 body is a tiny generic Apache
+    # ErrorDocument page returned with a consistent ~20-30ms *origin* timing
+    # on every single attempt, with or without warm-up/referer variations,
+    # which is the signature of a dead backend route rather than a solvable
+    # JS sensor wall).
+    #
+    # Found the real, current replacement by driving NSE's own "Bulk Deals/
+    # Block Deals/ Short Selling Archives" report page
+    # (https://www.nseindia.com/report-detail/display-bulk-and-block-deals)
+    # with Playwright and capturing what it actually calls when you click
+    # Go: `/api/historicalOR/bulk-block-short-deals?optionType=<mode>&from=
+    # ..&to=..` -- same host-prefix swap pattern as equity/derivatives above,
+    # just a different path and param name (`optionType=`, not a path
+    # segment), confirmed live for all three modes. Response shape is the
+    # same `{"data": [...]}` the old endpoint returned, just with a different
+    # (current) NSE column-name scheme:
+    #   bulk_deals/block_deals -> BD_DT_DATE, BD_DT_ORDER, BD_SYMBOL,
+    #                              BD_SCRIP_NAME, BD_CLIENT_NAME, BD_BUY_SELL,
+    #                              BD_QTY_TRD, BD_TP_WATP, BD_REMARKS
+    #   short_deals            -> SS_DATE, SS_DATE_ORDER, SS_SYMBOL, SS_NAME,
+    #                              SS_QTY
     if mode == "bulk_deals":
-        mode = "bulk-deals"
+        option_type = "bulk_deals"
     elif mode == "short_deals":
-        mode = "short-selling"
+        option_type = "short_selling"
     elif mode == "block_deals":
-        mode = "block-deals"
-    
-    url='https://www.nseindia.com/api/historical/' + mode + '?from=' + from_date + '&to=' + to_date
+        option_type = "block_deals"
+    else:
+        option_type = mode
+
+    url = ('https://www.nseindia.com/api/historicalOR/bulk-block-short-deals'
+           '?optionType=' + option_type + '&from=' + from_date + '&to=' + to_date)
     logging.info("Fetching " + str(url))
     payload = nsefetch(url)
     return pd.DataFrame(payload["data"])
@@ -1151,14 +1570,17 @@ def is_market_open(segment = "FO"): #COM,CD,CB,CMOT,COM,FO,IRD,MF,NDM,NTRP,SLBS
     # Get today's date in the format 'dd-Mon-yyyy'
     today_date = datetime.date.today().strftime('%d-%b-%Y')
 
-    # Check if today's date is in the holiday_json
+    # Check if today's date is in the holiday_json. NOTE: this previously
+    # returned on the FIRST holiday-list entry regardless of whether it
+    # matched today, so any date after the list's first entry was reported
+    # as "open" even on a real holiday -- it needs to scan every entry before
+    # concluding the market is open.
     for holiday in holiday_json:
-        if holiday['tradingDate'] != today_date:
-            print("FNO Market is open today. Have a Nice Trade!")
-            return True
         if holiday['tradingDate'] == today_date:
             print(f"Market is closed today because of {holiday['description']}")
             return False
+    print("FNO Market is open today. Have a Nice Trade!")
+    return True
 
 def nse_expirydetails_by_symbol(symbol,meta ="Futures",i=0):
     payload = nse_quote_derivatives(symbol)
@@ -1198,8 +1620,25 @@ def nse_expirydetails_by_symbol(symbol,meta ="Futures",i=0):
     dte = (currentExpiry_dt - date_today).days
     return currentExpiry_dt, dte
 
-def security_wise_archive(from_date, to_date, symbol, series="ALL"):   
-    base_url = "https://www.nseindia.com/api/historical/securityArchives"
-    url = f"{base_url}?from={from_date}&to={to_date}&symbol={symbol.upper()}&dataType=priceVolumeDeliverable&series={series.upper()}"
+def security_wise_archive(from_date, to_date, symbol, series="ALL"):
+    # The old /api/historical/securityArchives route is retired on the live
+    # site (confirmed HTTP 503 straight from NSE's origin -- same dead-route
+    # signature as nse_largedeals_historical() above, not a solvable Akamai
+    # challenge: tiny generic Apache ErrorDocument body, consistent fast
+    # origin timing on every attempt regardless of warm-up/referer).
+    #
+    # Found the real, current replacement by driving NSE's own "Security-wise
+    # Archives (Equities)" report page
+    # (https://www.nseindia.com/report-detail/eq_security) with Playwright
+    # and capturing what it actually calls when you click Go:
+    # `/api/historicalOR/generateSecurityWiseHistoricalData?from=..&to=..&
+    # symbol=..&type=..&series=..` -- same host-prefix-swap family as
+    # equity_history()/derivative_history() above, just a different path and
+    # `type=` instead of `dataType=`. Confirmed live: response shape is the
+    # same `{"data": [...]}` with the same CH_*/COP_DELIV_* column names the
+    # old endpoint used (cross-checked against equity_history()'s numbers for
+    # the same symbol/dates -- exact match).
+    base_url = "https://www.nseindia.com/api/historicalOR/generateSecurityWiseHistoricalData"
+    url = f"{base_url}?from={from_date}&to={to_date}&symbol={symbol.upper()}&type=priceVolumeDeliverable&series={series.upper()}"
     payload = nsefetch(url)
     return pd.DataFrame(payload['data'])
