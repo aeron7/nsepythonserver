@@ -1095,6 +1095,18 @@ def nse_fno(symbol):
         # Not an F&O symbol (or no derivatives data) -- fall back to the
         # equity quote instead of returning an empty/error payload.
         return nse_eq(symbol)
+    # The old quote-derivative response carried 'underlyingValue' at the
+    # top level (payload['underlyingValue']), and a fair amount of code
+    # written against that era still does nse_fno(symbol)['underlyingValue']
+    # -- confirmed live to KeyError now, since the new flat
+    # getSymbolDerivativesData response only carries it inside EACH entry
+    # of payload['data'] (every entry has the same value for a given
+    # symbol). Promote it back to the top level for backward compatibility,
+    # without removing or altering the existing 'data' key.
+    if payload['data']:
+        underlying_value = payload['data'][0].get('underlyingValue')
+        if underlying_value is not None:
+            payload['underlyingValue'] = underlying_value
     return payload
 
 def quote_equity(symbol):
@@ -1695,6 +1707,63 @@ def get_blockdeals():
     payload=pd.read_csv("https://archives.nseindia.com/content/equities/block.csv")
     return payload
 
+def _nse_top_corp_info(symbol):
+    """`/api/top-corp-info?symbol=X&market=equities` bundles a company's
+    latest announcements, corporate actions (bonus/dividend/split/demerger),
+    shareholding pattern history, financial results, and board meetings in
+    one call -- confirmed live and working through curl_cffi+warm-up. This
+    backs both dividend_timeline() and share_holding() below."""
+    symbol = nsesymbolpurify(symbol)
+    return nsefetch(f"https://www.nseindia.com/api/top-corp-info?symbol={symbol}&market=equities")
+
+
+def dividend_timeline(symbol):
+    """github.com/aeron7/nsepython issue #75: documented on
+    unofficed.com/nse-python/ but never actually implemented in the code
+    (calling it raised `AttributeError: module 'nsepythonserver' has no
+    attribute 'dividend_timeline'`) -- same situation as nsepython, and
+    missing from this package entirely until now. Implemented here from
+    `/api/top-corp-info`'s `corporate_actions` list, filtered down to the
+    dividend-purpose entries (that list also contains bonuses/splits/
+    demergers/etc, which this function intentionally excludes to match its
+    name)."""
+    data = _nse_top_corp_info(symbol)
+    actions = (data.get("corporate_actions") or {}).get("data") or []
+    dividends = [a for a in actions if "dividend" in (a.get("purpose") or "").lower()]
+    return pd.DataFrame.from_records(dividends)
+
+
+def share_holding(symbol):
+    """github.com/aeron7/nsepython issue #75: same situation as
+    dividend_timeline() above -- documented but not implemented (and, in this
+    package, not even present in the source). Built from
+    `/api/top-corp-info`'s `shareholdings_patterns` data, which is a dict
+    keyed by filing date (e.g. "31-Mar-2026") whose value is a list of
+    {"<category>": "<percent>"} rows (Promoter & Promoter Group / Public /
+    Shares held by Employee Trusts / Total). Flattened here into one row per
+    filing date with a column per category, newest filing first."""
+    data = _nse_top_corp_info(symbol)
+    by_date = (data.get("shareholdings_patterns") or {}).get("data") or {}
+    rows = []
+    for filing_date, categories in by_date.items():
+        row = {"date": filing_date}
+        for entry in categories:
+            for k, v in entry.items():
+                row[k.strip()] = v.strip() if isinstance(v, str) else v
+        rows.append(row)
+    df = pd.DataFrame.from_records(rows)
+    if not df.empty and "date" in df.columns:
+        try:
+            df = df.sort_values(
+                by="date",
+                key=lambda s: pd.to_datetime(s, format="%d-%b-%Y"),
+                ascending=False,
+            ).reset_index(drop=True)
+        except Exception:
+            pass
+    return df
+
+
 def nse_annual_reports(symbol, year_from=None, year_to=None, index="equities"):
     """Forum feature request (forum.unofficed.com topic 1459): list a listed
     company's annual reports with direct PDF download links, optionally
@@ -2033,7 +2102,7 @@ _NSE_MCP_HEADERS = {
     "Accept": "application/json, text/event-stream",
 }
 
-_NSE_MCP_CLIENT_VERSION = "2.98"
+_NSE_MCP_CLIENT_VERSION = "2.101"
 
 # Per-server-url cache of {headers-including-Mcp-Session-Id} so a normal run
 # of several nse_mcp_* calls against the same server doesn't re-run the
@@ -2273,13 +2342,29 @@ def nse_mcp_get_top_movers(date=None, n=10, direction="gain"):
     return pd.DataFrame(result.get("stocks", []))
 
 
-def nse_mcp_lookup_symbol(query):
+def nse_mcp_nse_lookup_symbol(query):
     """Look up NSE ticker symbols by partial name/keyword -- ticker list
     only, no price data, faster than nse_mcp_search_symbols when you just
     need the symbol. Backed by NSE's own official no-auth MCP server, not
-    the Akamai-affected nseindia.com scrape path."""
+    the Akamai-affected nseindia.com scrape path.
+
+    Named to match the underlying MCP tool's own name ("nse_lookup_symbol",
+    per this project's "name the wrapper after the tool itself" convention --
+    see nsepython's identically-named wrapper). Previously shipped on PyPI
+    as nse_mcp_lookup_symbol (missing the tool's own "nse_" prefix,
+    inconsistent with nsepython's wrapper for the same tool); that name is
+    kept below as a backward-compatible alias since it's already been live
+    for one release."""
     result = nse_mcp_call("bhavcopy", "nse_lookup_symbol", query=query)
     return result.get("symbols", [])
+
+
+def nse_mcp_lookup_symbol(query):
+    """Backward-compatible alias for nse_mcp_nse_lookup_symbol() -- this was
+    the name used in the prior release before it was corrected to match
+    nsepython's naming convention and the underlying MCP tool's own name.
+    Kept so existing callers don't break."""
+    return nse_mcp_nse_lookup_symbol(query)
 
 
 def nse_mcp_get_market_mood(date=None):
